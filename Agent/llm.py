@@ -38,8 +38,8 @@ if not _api_key:
 
 _client = Groq(api_key=_api_key)
 
-# llama-3.3-70b-versatile: best reasoning on Groq free tier
-_MODEL = "llama-3.3-70b-versatile"
+# llama-3.1-8b-instant: faster model with separate token limits
+_MODEL = "llama-3.8-70b-versatile"
 
 # ---------------------------------------------------------------------------
 # Prompt template — all dynamic data injected at call time
@@ -55,14 +55,11 @@ _SYSTEM_INSTRUCTION = (
 )
 
 _USER_PROMPT_TEMPLATE = """\
-ELIGIBLE INSTANCE IDs (you may ONLY act on these):
-{eligible_ids}
+ELIGIBLE INSTANCES (you may ONLY act on these):
+{eligible_summary}
 
-CURRENT STATE:
-{current_state}
-
-RECENT ACTION HISTORY (last 50 cycles):
-{history}
+RECENT HISTORY (last 10 cycles):
+{history_summary}
 
 Available tools: stop_instance, start_instance, resize_instance, tag_instance, do_nothing, alert_human.
 
@@ -95,10 +92,33 @@ def call_llm(
         ValueError: If the Groq response cannot be parsed as a JSON array.
                     The raw response text is included in the error message.
     """
+    # Create compact summaries to reduce token usage
+    eligible_summary = []
+    instance_lookup = {inst["id"]: inst for inst in state.get("instances", [])}
+    
+    for instance_id in eligible_ids:
+        inst = instance_lookup.get(instance_id, {})
+        metrics = inst.get("metrics", {})
+        cpu_avg = sum(metrics.get("CpuUtilizationPercent", [])) / max(1, len(metrics.get("CpuUtilizationPercent", [])))
+        disk_read = sum(metrics.get("DiskReadBytes", [])) / max(1, len(metrics.get("DiskReadBytes", [])))
+        disk_write = sum(metrics.get("DiskWriteBytes", [])) / max(1, len(metrics.get("DiskWriteBytes", [])))
+        
+        eligible_summary.append(f"{instance_id} ({inst.get('name', 'unknown')}) "
+                               f"type:{inst.get('instance_type', 'unknown')} "
+                               f"status:{inst.get('status', 'unknown')} "
+                               f"cpu:{cpu_avg:.1f}% disk_read:{disk_read/1024/1024:.1f}MB disk_write:{disk_write/1024/1024:.1f}MB")
+    
+    # Compact history (last 10 actions only)
+    recent_history = history[-10:] if len(history) > 10 else history
+    history_summary = []
+    for record in recent_history:
+        history_summary.append(f"cycle {record.get('cycle', '?')}: "
+                              f"{record.get('action', 'unknown')} on "
+                              f"{record.get('instance_name', 'unknown')}")
+
     user_prompt = _USER_PROMPT_TEMPLATE.format(
-        eligible_ids="\n".join(eligible_ids) if eligible_ids else "(none)",
-        current_state=json.dumps(state, indent=2),
-        history=json.dumps(history, indent=2),
+        eligible_summary="\n".join(eligible_summary) if eligible_summary else "(none)",
+        history_summary="\n".join(history_summary) if history_summary else "(none)",
     )
 
     # Exactly one API call per invocation

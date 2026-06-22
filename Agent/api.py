@@ -114,6 +114,27 @@ router = APIRouter(prefix="/api")
 
 
 # ---------------------------------------------------------------------------
+# GET /api/metrics
+# ---------------------------------------------------------------------------
+
+@router.get("/metrics")
+def get_current_metrics():
+    """Return current CloudWatch metrics for all instances."""
+    from observer import observe_all
+    try:
+        state = observe_all()
+        return {"instances": [
+            {
+                "id": inst["id"],
+                "name": inst["name"], 
+                "metrics": inst["metrics"]
+            } for inst in state.get("instances", [])
+        ]}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to fetch metrics: {str(e)}")
+
+
+# ---------------------------------------------------------------------------
 # GET /api/instances
 # ---------------------------------------------------------------------------
 
@@ -240,3 +261,33 @@ def set_killswitch(body: KillSwitchRequest, db: Session = Depends(get_db)):
     db.commit()
     db.refresh(new_row)
     return KillSwitchSchema(active=bool(new_row.active), toggled_at=new_row.toggled_at)
+
+
+# ---------------------------------------------------------------------------
+# POST /api/instances/{instance_id}/stop
+# ---------------------------------------------------------------------------
+
+@router.post("/instances/{instance_id}/stop")
+def stop_instance_manual(instance_id: str):
+    """Manually stop an EC2 instance."""
+    from executor import stop_instance
+    try:
+        result = stop_instance(instance_id=instance_id)
+        return {"status": "success", "instance_id": instance_id, "aws_response": result}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ---------------------------------------------------------------------------
+# POST /api/instances/{instance_id}/start
+# ---------------------------------------------------------------------------
+
+@router.post("/instances/{instance_id}/start")
+def start_instance_manual(instance_id: str):
+    """Manually start an EC2 instance."""
+    from executor import start_instance
+    try:
+        result = start_instance(instance_id=instance_id)
+        return {"status": "success", "instance_id": instance_id, "aws_response": result}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))

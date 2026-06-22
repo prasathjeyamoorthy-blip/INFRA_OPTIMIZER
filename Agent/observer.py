@@ -109,8 +109,8 @@ def observe_all() -> dict:
             instance_type = raw.get("InstanceType", "")
             status = raw.get("State", {}).get("Name", "")
 
-            # Step 2: Fetch CloudWatch metrics for this instance
-            metrics = _fetch_metrics(name)
+            # Step 2: Fetch real AWS CloudWatch metrics for this instance
+            metrics = _fetch_real_aws_metrics(instance_id)
 
             instances.append(
                 {
@@ -130,65 +130,102 @@ def observe_all() -> dict:
 # Internal helpers
 # ---------------------------------------------------------------------------
 
-def _fetch_metrics(instance_name: str) -> dict:
+def _fetch_real_aws_metrics(instance_id: str) -> dict:
     """
-    Retrieve the last _DATAPOINTS data points for each metric in _METRICS
-    from CloudWatch namespace _NAMESPACE, dimensioned by instance name.
-
+    Retrieve real AWS CloudWatch metrics for an EC2 instance.
+    
+    Gets the last 3 data points for CPU utilization and network traffic.
+    AWS provides these metrics by default for all EC2 instances.
+    
     Args:
-        instance_name: The Name tag value of the EC2 instance.
-
+        instance_id: The EC2 instance ID (e.g., "i-1234567890abcdef0").
+        
     Returns:
-        {"CpuUtilizationPercent": [float, ...], "LatencyMs": [float, ...]}
-        Values are sorted by timestamp ascending; up to _DATAPOINTS entries each.
+        {"CpuUtilizationPercent": [float, ...], "NetworkPacketsIn": [float, ...]}
     """
     end_time = datetime.now(tz=timezone.utc)
-    # Request a generous window so we are sure to capture the last N points
-    # even with a 10-second publish interval.  1 hour is well beyond what we need.
+    # Look back 1 hour to get recent data points
     start_time = end_time - timedelta(hours=1)
-
-    # Build one MetricDataQuery per tracked metric
-    metric_data_queries = [
+    
+    # AWS built-in EC2 metrics - CPU and Disk only
+    metric_queries = [
         {
-            "Id": _safe_id(metric_name),
+            "Id": "cpu_utilization",
             "MetricStat": {
                 "Metric": {
-                    "Namespace": _NAMESPACE,
-                    "MetricName": metric_name,
+                    "Namespace": "AWS/EC2",
+                    "MetricName": "CPUUtilization",
                     "Dimensions": [
-                        {"Name": "InstanceName", "Value": instance_name}
+                        {"Name": "InstanceId", "Value": instance_id}
                     ],
                 },
-                "Period": 10,       # matches publisher's PUBLISH_INTERVAL
+                "Period": 300,  # 5-minute periods (standard for AWS/EC2)
                 "Stat": "Average",
             },
             "ReturnData": True,
+        },
+        {
+            "Id": "disk_read_bytes",
+            "MetricStat": {
+                "Metric": {
+                    "Namespace": "AWS/EC2",
+                    "MetricName": "DiskReadBytes",
+                    "Dimensions": [
+                        {"Name": "InstanceId", "Value": instance_id}
+                    ],
+                },
+                "Period": 300,
+                "Stat": "Sum",
+            },
+            "ReturnData": True,
+        },
+        {
+            "Id": "disk_write_bytes",
+            "MetricStat": {
+                "Metric": {
+                    "Namespace": "AWS/EC2",
+                    "MetricName": "DiskWriteBytes", 
+                    "Dimensions": [
+                        {"Name": "InstanceId", "Value": instance_id}
+                    ],
+                },
+                "Period": 300,
+                "Stat": "Sum",
+            },
+            "ReturnData": True,
         }
-        for metric_name in _METRICS
     ]
-
-    cw_response = _cloudwatch.get_metric_data(
-        MetricDataQueries=metric_data_queries,
-        StartTime=start_time,
-        EndTime=end_time,
-        ScanBy="TimestampDescending",
-    )
-
-    result: dict[str, list[float]] = {}
-
-    for metric_result in cw_response.get("MetricDataResults", []):
-        # Map the query ID back to the original metric name
-        metric_name = _id_to_metric(metric_result["Id"])
-        # Values come in descending order (newest first); reverse to ascending,
-        # then keep only the last _DATAPOINTS entries.
-        values = list(reversed(metric_result.get("Values", [])))
-        result[metric_name] = values[-_DATAPOINTS:] if len(values) > _DATAPOINTS else values
-
-    # Ensure every metric key is present even if CloudWatch returned no data
-    for metric_name in _METRICS:
-        result.setdefault(metric_name, [])
-
-    return result
+    
+    try:
+        cw_response = _cloudwatch.get_metric_data(
+            MetricDataQueries=metric_queries,
+            StartTime=start_time,
+            EndTime=end_time,
+            ScanBy="TimestampDescending",
+        )
+        
+        result = {
+            "CpuUtilizationPercent": [], 
+            "DiskReadBytes": [],
+            "DiskWriteBytes": []
+        }
+        
+        for metric_result in cw_response.get("MetricDataResults", []):
+            values = list(reversed(metric_result.get("Values", [])))
+            limited_values = values[-_DATAPOINTS:] if len(values) > _DATAPOINTS else values
+            
+            if metric_result["Id"] == "cpu_utilization":
+                result["CpuUtilizationPercent"] = limited_values
+            elif metric_result["Id"] == "disk_read_bytes":
+                result["DiskReadBytes"] = limited_values
+            elif metric_result["Id"] == "disk_write_bytes":
+                result["DiskWriteBytes"] = limited_values
+                
+        return result
+        
+    except Exception:
+        # If CloudWatch query fails, return empty metrics
+        return {"CpuUtilizationPercent": [], "DiskReadBytes": [], "DiskWriteBytes": []}
 
 
 def _safe_id(metric_name: str) -> str:
