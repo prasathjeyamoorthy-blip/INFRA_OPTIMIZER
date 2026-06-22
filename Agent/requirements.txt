@@ -8,3 +8,6 @@ pydantic==2.6.4
 python-dotenv==1.0.1
 PyQt6==6.7.0
 pyqtgraph==0.13.7
+langchain-groq==0.1.9
+langchain-core==0.2.39
+langgraph==0.2.28

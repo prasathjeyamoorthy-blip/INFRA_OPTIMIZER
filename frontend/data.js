@@ -54,14 +54,22 @@ async function loadLiveInstances() {
     id: inst.id,
     name: inst.name,
     type: inst.instance_type,
-    region: 'us-east-1',
+    region: inst.tags['aws:region'] || inst.tags['region'] || 'us-east-1',
     cpu: 0,
-    diskRead: 0,
-    diskWrite: 0,
+    diskReadBytes: 0,
+    diskReadOps: 0,
+    diskWriteBytes: 0,
+    diskWriteOps: 0,
+    networkIn: 0,
+    networkOut: 0,
+    networkPktsIn: 0,
+    networkPktsOut: 0,
     cost: 0,
     protected: inst.tags.protected === 'true',
     status: inst.status === 'running' ? 'healthy' : 'stopped',
     running: inst.status === 'running',
+    lastAction: inst.last_action || null,
+    updatedAt: inst.updated_at || null,
   }));
 }
 
@@ -71,14 +79,20 @@ async function loadLiveMetrics() {
   
   const metricsMap = {};
   data.instances.forEach(inst => {
-    const cpu = inst.metrics.CpuUtilizationPercent;
-    const diskRead = inst.metrics.DiskReadBytes;
-    const diskWrite = inst.metrics.DiskWriteBytes;
-    
+    const m = inst.metrics;
+    const last = (arr) => (arr && arr.length) ? arr[arr.length - 1] : 0;
+    const mb = (v) => Math.round(v / 1024 / 1024 * 100) / 100;
+
     metricsMap[inst.id] = {
-      cpu: cpu.length ? Math.round(cpu[cpu.length - 1]) : 0,
-      diskRead: diskRead.length ? Math.round(diskRead[diskRead.length - 1] / 1024 / 1024) : 0,
-      diskWrite: diskWrite.length ? Math.round(diskWrite[diskWrite.length - 1] / 1024 / 1024) : 0,
+      cpu:              Math.round(last(m.CPUUtilization) * 10) / 10,
+      diskReadBytes:    mb(last(m.DiskReadBytes)),
+      diskReadOps:      Math.round(last(m.DiskReadOps)),
+      diskWriteBytes:   mb(last(m.DiskWriteBytes)),
+      diskWriteOps:     Math.round(last(m.DiskWriteOps)),
+      networkIn:        mb(last(m.NetworkIn)),
+      networkOut:       mb(last(m.NetworkOut)),
+      networkPktsIn:    Math.round(last(m.NetworkPacketsIn)),
+      networkPktsOut:   Math.round(last(m.NetworkPacketsOut)),
     };
   });
   
@@ -88,15 +102,45 @@ async function loadLiveMetrics() {
 async function loadLiveCycles() {
   const data = await fetchAPI('/cycles?limit=50');
   if (!data) return [];
+
+  // Build a lookup map of instance_id → project tag from already-loaded instancesData
+  const projectMap = {};
+  instancesData.forEach(inst => {
+    const tags = inst.tags || {};
+    projectMap[inst.id] = tags.project || 'cost-optimizer-agent';
+  });
   
   return data.map(cycle => ({
-    time: new Date(cycle.timestamp).toLocaleString(),
-    instance: cycle.instance_name,
-    action: cycle.action,
-    reason: cycle.reasoning,
-    result: cycle.validated ? 'success' : 'failed',
-    cycle: cycle.cycle,
+    time:        toIST(cycle.timestamp),
+    instance:    cycle.instance_name,
+    instance_id: cycle.instance_id,
+    project:     projectMap[cycle.instance_id] || 'cost-optimizer-agent',
+    action:      cycle.action,
+    reason:      cycle.reasoning,
+    result:      cycle.validated ? 'success' : 'failed',
+    cycle:       cycle.cycle,
   }));
+}
+
+function toIST(ts) {
+  if (!ts) return '—';
+  try {
+    const d = new Date(ts);
+    if (isNaN(d)) return ts;
+    // IST = UTC + 5:30
+    return d.toLocaleString('en-IN', {
+      timeZone: 'Asia/Kolkata',
+      year:     'numeric',
+      month:    'short',
+      day:      '2-digit',
+      hour:     '2-digit',
+      minute:   '2-digit',
+      second:   '2-digit',
+      hour12:   false,
+    });
+  } catch {
+    return String(ts);
+  }
 }
 
 async function loadLiveCost() {
@@ -127,9 +171,16 @@ async function refreshLiveData() {
   const metrics = await loadLiveMetrics();
   instancesData.forEach(inst => {
     if (metrics[inst.id]) {
-      inst.cpu = metrics[inst.id].cpu;
-      inst.diskRead = metrics[inst.id].diskRead;
-      inst.diskWrite = metrics[inst.id].diskWrite;
+      const m = metrics[inst.id];
+      inst.cpu          = m.cpu;
+      inst.diskReadBytes  = m.diskReadBytes;
+      inst.diskReadOps    = m.diskReadOps;
+      inst.diskWriteBytes = m.diskWriteBytes;
+      inst.diskWriteOps   = m.diskWriteOps;
+      inst.networkIn      = m.networkIn;
+      inst.networkOut     = m.networkOut;
+      inst.networkPktsIn  = m.networkPktsIn;
+      inst.networkPktsOut = m.networkPktsOut;
       inst.status = inst.cpu > 85 ? 'critical' : (inst.cpu > 60 ? 'warning' : 'healthy');
     }
   });

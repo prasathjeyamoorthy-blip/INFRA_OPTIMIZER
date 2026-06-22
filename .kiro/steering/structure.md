@@ -17,7 +17,6 @@
     ├── orchestrator.py     # main loop — sequences every cycle
     ├── api.py              # FastAPI route handlers + Pydantic schemas
     ├── main.py             # FastAPI app + uvicorn entry point
-    ├── publisher.py        # synthetic CloudWatch metric publisher
     ├── setup_aws.py        # one-time AWS provisioning script
     ├── test_smoke.py       # lightweight smoke tests (no live AWS)
     └── audit.db            # SQLite — auto-created on first run (gitignored)
@@ -36,14 +35,12 @@
 | `executor.py` | Maps tool names to boto3 calls via `TOOL_DISPATCH` dict |
 | `orchestrator.py` | Sequences all modules in a 10-step cycle loop |
 | `api.py` + `main.py` | REST API for the dashboard; reads DB only |
-| `publisher.py` | Independent process; pushes synthetic metrics to CloudWatch |
 | `setup_aws.py` | Run once to provision EC2 instances and IAM user |
 | `test_smoke.py` | Validates imports and core logic without live AWS |
 
 ## Four concurrent processes
 1. `python Agent/main.py` — API server (port 8000)
 2. `python Agent/orchestrator.py` — observe–decide–act loop
-3. `python Agent/publisher.py` — CloudWatch metric publisher
 4. Dashboard (external consumer, already implemented)
 
 Shared state between processes flows exclusively through `audit.db`.

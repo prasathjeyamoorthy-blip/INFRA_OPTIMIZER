@@ -41,9 +41,12 @@ load_dotenv(dotenv_path=Path(__file__).resolve().parent / ".env")
 # ---------------------------------------------------------------------------
 
 from db import (
+    get_pending_resizes,
     get_recent_cycles,
     init_db,
     is_kill_switch_active,
+    set_pending_resize,
+    sync_instances_from_aws,
     upsert_instance_snapshot,
     write_cycle_records,
 )
@@ -112,7 +115,13 @@ def run() -> None:
     steps 1–9 is caught, logged, and the loop continues with the next cycle.
     """
     init_db()
-    logger.info("Database initialised.  Starting orchestrator loop.")
+    logger.info("Database initialised. Syncing instances from AWS...")
+    try:
+        count = sync_instances_from_aws()
+        logger.info("Startup sync complete: %d instance(s) loaded from AWS.", count)
+    except Exception as exc:
+        logger.warning("Startup AWS sync failed (continuing): %s", exc)
+    logger.info("Starting orchestrator loop.")
 
     cycle_num: int = 0
 
@@ -150,6 +159,17 @@ def run() -> None:
             history: list[dict] = get_recent_cycles(limit=50)
 
             # ------------------------------------------------------------------
+            # Step 4b — Load pending resizes (instances stopped for high CPU
+            #            that need an upgrade once cooldown expires)
+            # ------------------------------------------------------------------
+            pending_resizes: dict[str, str] = get_pending_resizes()
+
+            # Inject pending resize info into state so LLM sees it
+            for inst in state.get("instances", []):
+                if inst["id"] in pending_resizes:
+                    inst["pending_resize"] = pending_resizes[inst["id"]]
+
+            # ------------------------------------------------------------------
             # Step 5 — Filter eligible instances (pre-LLM safety check)
             # ------------------------------------------------------------------
             eligible_ids: list[str] = filter_eligible_instances(state, history)
@@ -162,9 +182,9 @@ def run() -> None:
 
             # ------------------------------------------------------------------
             # Steps 6–8 — LLM decision + validation + execution
-            # Skipped entirely when the kill switch is active.
+            # Skipped when kill switch is active OR no eligible instances.
             # ------------------------------------------------------------------
-            if not kill_active:
+            if not kill_active and eligible_ids:
                 # Step 6 — Ask the LLM to decide what actions to take
                 llm_actions: list[dict] = call_llm(state, eligible_ids, history)
                 logger.info(
@@ -185,14 +205,74 @@ def run() -> None:
                 for action in validated:
                     tool_fn = TOOL_DISPATCH[action["tool"]]
                     aws_resp: dict = tool_fn(**action)
+                    import datetime as _dt
+
+                    instance_name = _name_for(state, action.get("instance_id", ""))
+                    instance_id   = action.get("instance_id", "")
+                    tool          = action["tool"]
+                    reasoning     = action.get("reasoning", "")
+
+                    # ── Prominent terminal log for every agent action ──────────
+                    logger.info(
+                        "\n"
+                        "╔══════════════════════════════════════════════════════╗\n"
+                        "  🤖 AGENT ACTION — Cycle %d\n"
+                        "  Action   : %s\n"
+                        "  Instance : %s  (%s)\n"
+                        "  Reason   : %s\n"
+                        "  AWS resp : %s\n"
+                        "╚══════════════════════════════════════════════════════╝",
+                        cycle_num,
+                        tool.upper(),
+                        instance_name,
+                        instance_id,
+                        reasoning,
+                        json.dumps(aws_resp)[:120],
+                    )
+
+                    # ── Post-action side effects ───────────────────────────────
+                    # If agent stopped an instance due to high CPU, mark it for
+                    # resize so the LLM knows to upgrade it after cooldown ends
+                    if tool == "stop_instance":
+                        inst_meta = next(
+                            (i for i in state.get("instances", []) if i["id"] == instance_id),
+                            {}
+                        )
+                        m = inst_meta.get("metrics", {})
+                        cpu_vals = m.get("CPUUtilization", [])
+                        avg_cpu = sum(cpu_vals) / len(cpu_vals) if cpu_vals else 0
+                        # If stopped due to high CPU spike (>= 80%), flag for resize
+                        if avg_cpu >= 80.0:
+                            current_type = inst_meta.get("instance_type", "t3.micro")
+                            upgrade_map = {
+                                "t3.nano":    "t3.micro",
+                                "t3.micro":   "t3.small",
+                                "t3.small":   "t3.medium",
+                                "t3.medium":  "t3.large",
+                                "t3.large":   "t3.xlarge",
+                                "t3.xlarge":  "t3.2xlarge",
+                            }
+                            target_type = upgrade_map.get(current_type, "t3.small")
+                            set_pending_resize(instance_id, target_type)
+                            logger.info(
+                                "📌 Marked %s for pending resize: %s → %s "
+                                "(stopped due to CPU spike %.1f%%)",
+                                instance_name, current_type, target_type, avg_cpu
+                            )
+
+                    # If agent resized an instance, clear the pending resize flag
+                    if tool == "resize_instance":
+                        set_pending_resize(instance_id, None)
+                        logger.info("✅ Cleared pending resize for %s after resize.", instance_name)
 
                     records.append(
                         {
                             "cycle":         cycle_num,
-                            "instance_id":   action.get("instance_id"),
-                            "instance_name": _name_for(state, action.get("instance_id", "")),
-                            "action":        action["tool"],
-                            "reasoning":     action.get("reasoning", ""),
+                            "timestamp":     _dt.datetime.utcnow().isoformat(),
+                            "instance_id":   instance_id,
+                            "instance_name": instance_name,
+                            "action":        tool,
+                            "reasoning":     reasoning,
                             "validated":     True,
                             "aws_response":  json.dumps(aws_resp),
                         }

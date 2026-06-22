@@ -33,7 +33,7 @@ python Agent/main.py
 python Agent/orchestrator.py
 
 # Run synthetic metric publisher (separate terminal)
-python Agent/publisher.py
+# publisher.py has been removed — the observer reads native AWS/EC2 CloudWatch metrics directly
 
 # Provision AWS infrastructure (run once)
 python Agent/setup_aws.py

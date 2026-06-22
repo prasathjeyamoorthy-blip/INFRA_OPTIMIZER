@@ -140,11 +140,15 @@ def get_current_metrics():
 
 @router.get("/instances", response_model=list[InstanceSchema])
 def list_instances(db: Session = Depends(get_db)):
-    """Return all instance snapshots from the instances table."""
+    """Return instance snapshots excluding terminated instances."""
+    _EXCLUDED_STATES = {"terminated", "shutting-down"}
     rows = db.query(Instance).all()
     result = []
     for row in rows:
-        # Parse tags from JSON string to dict
+        # Skip terminated / shutting-down instances
+        if (row.status or "").lower() in _EXCLUDED_STATES:
+            continue
+
         tags = row.tags
         if isinstance(tags, str):
             try:
@@ -211,6 +215,10 @@ def get_cost_summary(db: Session = Depends(get_db)):
 
     for row in rows:
         status = (row.status or "").lower()
+        # Skip terminated instances entirely
+        if status in ("terminated", "shutting-down"):
+            continue
+        total_instances += 1
         if status == "running":
             running_count += 1
             hourly_rate = _INSTANCE_PRICING_USD_PER_HOUR.get(

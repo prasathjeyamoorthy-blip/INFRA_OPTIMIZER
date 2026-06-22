@@ -20,7 +20,6 @@ An autonomous observe–decide–act loop that monitors live AWS EC2 instances, 
 ├── models.py             # SQLAlchemy table definitions
 ├── api.py                # FastAPI route handlers
 ├── main.py               # FastAPI app + uvicorn entry point
-├── publisher.py          # synthetic CloudWatch metric publisher
 ├── audit.db              # SQLite (auto-created on first run)
 └── .env                  # secrets — never commit
 ```

@@ -8,7 +8,7 @@ const state = {
   instanceFilter: 'all',
   auditFilter: 'all',
   auditQuery: '',
-  uptimeSeconds: 4 * 3600 + 12 * 60 + 8,
+  uptimeSeconds: 0,  // starts at 0 on page load
 };
 
 /* ============================================================
@@ -92,14 +92,22 @@ function instanceCardHTML(inst) {
 
       <div class="metric-rows">
         <div class="metric-row">
-          <div class="metric-row-top"><span class="m-label">CPU</span><span class="m-value">${inst.cpu}%</span></div>
-          <div class="meter-track"><div class="meter-fill ${meterClass(inst.cpu)}" style="width:${inst.cpu}%"></div></div>
+          <div class="metric-row-top"><span class="m-label">CPU Utilization</span><span class="m-value">${inst.cpu}%</span></div>
+          <div class="meter-track"><div class="meter-fill ${meterClass(inst.cpu)}" style="width:${Math.min(inst.cpu,100)}%"></div></div>
         </div>
         <div class="metric-row">
-          <div class="metric-row-top"><span class="m-label">Disk Read</span><span class="m-value">${inst.diskRead}MB</span></div>
+          <div class="metric-row-top"><span class="m-label">Disk Read</span><span class="m-value">${inst.diskReadBytes} MB &nbsp;·&nbsp; ${inst.diskReadOps} ops</span></div>
+          <div class="meter-track"><div class="meter-fill" style="width:${Math.min(inst.diskReadBytes/10,100)}%"></div></div>
         </div>
         <div class="metric-row">
-          <div class="metric-row-top"><span class="m-label">Disk Write</span><span class="m-value">${inst.diskWrite}MB</span></div>
+          <div class="metric-row-top"><span class="m-label">Disk Write</span><span class="m-value">${inst.diskWriteBytes} MB &nbsp;·&nbsp; ${inst.diskWriteOps} ops</span></div>
+          <div class="meter-track"><div class="meter-fill" style="width:${Math.min(inst.diskWriteBytes/10,100)}%"></div></div>
+        </div>
+        <div class="metric-row">
+          <div class="metric-row-top"><span class="m-label">Network In / Out</span><span class="m-value">${inst.networkIn} MB &nbsp;/&nbsp; ${inst.networkOut} MB</span></div>
+        </div>
+        <div class="metric-row">
+          <div class="metric-row-top"><span class="m-label">Packets In / Out</span><span class="m-value">${inst.networkPktsIn} &nbsp;/&nbsp; ${inst.networkPktsOut}</span></div>
         </div>
       </div>
 
@@ -126,7 +134,6 @@ function instanceCardHTML(inst) {
                 <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M6 4l13 8-13 8V4z"/></svg>
                </button>`
           }
-        </div>
         </div>
       </div>
     </div>
@@ -199,8 +206,6 @@ function setAgentStatus(status) {
   const label = document.getElementById('statusLabel');
   dot.className = 'status-dot ' + (status === 'active' ? 'status-active' : status === 'thinking' ? 'status-thinking' : 'status-stopped');
   label.textContent = status === 'active' ? 'Active' : status === 'thinking' ? 'Thinking' : 'Emergency Stop';
-  document.getElementById('agentOrb').style.background = status === 'stopped' ? 'var(--red)' : 'var(--agent)';
-  document.getElementById('agentOrb').style.animationPlayState = status === 'stopped' ? 'paused' : 'running';
 }
 
 function typeText(el, text, speed, onDone) {
@@ -708,59 +713,54 @@ function drawGroupedBarChart(canvasId, labels, seriesA, seriesB, colorA, colorB)
 }
 
 function renderCharts() {
-  const days = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun'];
-  drawLineChart('chartCostTrend', days, [3420, 3180, 3050, 2960, 2890, 2845], 'rgba(94,234,212,1)');
-  drawLineChart('chartSavingsTrend', days, [180, 310, 420, 510, 640, 732], 'rgba(52,211,153,1)');
+  // Cost trend — derived from actual cost data per cycle (real data)
+  const recentCycles = cyclesData.slice(0, 6).reverse();
+  const cycleLabels = recentCycles.length
+    ? recentCycles.map(c => `C${c.cycle}`)
+    : ['—', '—', '—', '—', '—', '—'];
 
-  const instLabels = instancesData.slice(0, 6).map(i => i.name.split('-').slice(0,2).join('-'));
-  const instCosts = instancesData.slice(0, 6).map(i => +(i.cost * 24 * 30).toFixed(0));
-  drawBarChart('chartCostByInstance', instLabels, instCosts, 'rgba(129,140,248,1)');
+  // Hourly cost per instance from real data
+  const instLabels = instancesData.slice(0, 6).map(i => i.name || i.id.slice(-4));
+  const instCosts  = instancesData.slice(0, 6).map(i => +(((i.cost || 0) * 24 * 30).toFixed(0)));
+  if (instCosts.length) drawBarChart('chartCostByInstance', instLabels, instCosts, 'rgba(129,140,248,1)');
 
-  drawGroupedBarChart('chartBeforeAfter', days, [3420, 3380, 3350, 3300, 3280, 3250], [3420, 3180, 3050, 2960, 2890, 2845], 'rgba(248,113,113,0.5)', 'rgba(94,234,212,1)');
+  // CPU across instances — real metrics
+  const cpuValues = instancesData.map(i => i.cpu || 0);
+  const cpuLabels = instancesData.map(i => i.name || i.id.slice(-4));
+  if (cpuValues.length) drawBarChart('chartCostTrend', cpuLabels, cpuValues, 'rgba(94,234,212,1)');
 }
 
 function renderSavingsCounters() {
   const row = document.getElementById('savingsCounterRow');
+  if (!row) return;
+  const hourly = costData ? costData.hourly : 0;
+  const daily  = (hourly * 24).toFixed(2);
+  const weekly = (hourly * 24 * 7).toFixed(2);
+  const monthly = (hourly * 730).toFixed(2);
   row.innerHTML = `
     <div class="savings-counter-card">
-      <span class="sc-label">Daily savings</span>
-      <span class="sc-value mono" id="scDaily">$0</span>
-      <span class="sc-sub">vs. pre-agent baseline</span>
+      <span class="sc-label">Daily cost</span>
+      <span class="sc-value mono" id="scDaily">$${daily}</span>
+      <span class="sc-sub">at current hourly rate</span>
     </div>
     <div class="savings-counter-card">
-      <span class="sc-label">Weekly savings</span>
-      <span class="sc-value mono" id="scWeekly">$0</span>
-      <span class="sc-sub">last 7 days</span>
+      <span class="sc-label">Weekly cost</span>
+      <span class="sc-value mono" id="scWeekly">$${weekly}</span>
+      <span class="sc-sub">projected</span>
     </div>
     <div class="savings-counter-card">
-      <span class="sc-label">Monthly savings</span>
-      <span class="sc-value mono" id="scMonthly">$0</span>
-      <span class="sc-sub">last 30 days</span>
+      <span class="sc-label">Monthly cost</span>
+      <span class="sc-value mono" id="scMonthly">$${monthly}</span>
+      <span class="sc-sub">projected (730h)</span>
     </div>
   `;
-  animateCounter(document.getElementById('scDaily'), 0, 24, 1000, v => `$${v}`);
-  animateCounter(document.getElementById('scWeekly'), 0, 168, 1000, v => `$${v}`);
-  animateCounter(document.getElementById('scMonthly'), 0, 732, 1200, v => `$${v}`);
 }
 
 /* ============================================================
-   LIVE METRIC DRIFT (simulated real-time updates)
+   LIVE METRIC DRIFT — REMOVED
+   All metrics come from real CloudWatch via /api/metrics.
+   No simulated drift.
    ============================================================ */
-function driftInstanceMetrics() {
-  instancesData.forEach(inst => {
-    if (!inst.running || inst.protected) {
-      // protected/critical infra drifts gently
-      inst.cpu = clamp(inst.cpu + rand(-2, 2), 1, 80);
-    } else {
-      inst.cpu = clamp(inst.cpu + rand(-4, 4), 1, 98);
-    }
-    inst.diskRead = clamp(inst.diskRead + rand(-200, 200), 50, 6000);
-    inst.diskWrite = clamp(inst.diskWrite + rand(-100, 100), 20, 3000);
-    inst.network = clamp(inst.network + rand(-5, 5), 2, 95);
-    inst.status = inst.running ? statusFromCpu(inst.cpu) : 'healthy';
-  });
-}
-function clamp(v, min, max) { return Math.max(min, Math.min(max, Math.round(v))); }
 
 function tickUptime() {
   state.uptimeSeconds++;
@@ -781,20 +781,35 @@ function renderRecentActions() {
     container.innerHTML = '<div style="padding: 40px; text-align: center; color: var(--text-tertiary);">No actions yet. Agent is observing...</div>';
     return;
   }
+
+  const ACTION_COLORS = {
+    stop_instance:   '#e74c3c',
+    start_instance:  '#2ecc71',
+    resize_instance: '#f39c12',
+    tag_instance:    '#3498db',
+    do_nothing:      '#7f8c8d',
+    alert_human:     '#e67e22',
+  };
   
-  container.innerHTML = cyclesData.slice(0, 10).map(cycle => `
-    <div style="padding: 16px; border-bottom: 1px solid var(--border-subtle);">
-      <div style="display: flex; justify-content: space-between; margin-bottom: 8px;">
-        <span style="font-weight: 600; color: var(--text-primary);">${cycle.instance}</span>
-        <span style="font-size: 13px; color: var(--text-tertiary);">${cycle.time}</span>
+  container.innerHTML = cyclesData.slice(0, 10).map(cycle => {
+    const actionColor = ACTION_COLORS[cycle.action] || '#a0a0a0';
+    return `
+    <div style="padding: 14px 16px; border-bottom: 1px solid var(--border-subtle);">
+      <div style="display: flex; justify-content: space-between; align-items: flex-start; margin-bottom: 6px;">
+        <div>
+          <span style="font-weight: 600; color: var(--text-primary); font-size: 14px;">${cycle.instance || '—'}</span>
+          <span style="margin-left: 8px; font-size: 11px; color: var(--text-tertiary); font-family: monospace;">${cycle.instance_id || ''}</span>
+        </div>
+        <span style="font-size: 12px; color: var(--text-tertiary); white-space: nowrap; margin-left: 12px;">${cycle.time}</span>
       </div>
-      <div style="margin-bottom: 8px;">
-        <code style="padding: 4px 8px; background: var(--bg-secondary); border-radius: 4px; font-size: 13px;">${cycle.action}</code>
-        <span style="margin-left: 8px; padding: 2px 8px; background: ${cycle.result === 'success' ? 'var(--green)' : 'var(--yellow)'}; color: white; border-radius: 4px; font-size: 12px;">${cycle.result}</span>
+      <div style="margin-bottom: 6px; display: flex; align-items: center; gap: 8px;">
+        <code style="padding: 3px 8px; background: ${actionColor}22; color: ${actionColor}; border: 1px solid ${actionColor}44; border-radius: 4px; font-size: 12px;">${cycle.action}</code>
+        <span style="padding: 2px 8px; background: ${cycle.result === 'success' ? 'var(--green)' : '#e74c3c'}; color: white; border-radius: 4px; font-size: 11px;">${cycle.result}</span>
+        <span style="font-size: 11px; color: var(--text-tertiary);">project: ${cycle.project || 'cost-optimizer-agent'}</span>
       </div>
-      <div style="color: var(--text-secondary); font-size: 14px;">${cycle.reason}</div>
+      <div style="color: var(--text-secondary); font-size: 13px; font-style: italic;">${cycle.reason}</div>
     </div>
-  `).join('');
+  `}).join('');
 }
 
 function renderCostAnalytics() {

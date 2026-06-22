@@ -19,7 +19,7 @@ from botocore.config import Config
 from dotenv import load_dotenv
 
 # ---------------------------------------------------------------------------
-# Environment loading — must happen before building any boto3 client
+# Environment loading
 # ---------------------------------------------------------------------------
 
 load_dotenv(dotenv_path=Path(__file__).resolve().parent / ".env")
@@ -34,7 +34,7 @@ for _var in _REQUIRED_ENV_VARS:
         )
 
 # ---------------------------------------------------------------------------
-# Module-level boto3 clients (built once at import time)
+# boto3 clients
 # ---------------------------------------------------------------------------
 
 _boto_config = Config(connect_timeout=10, read_timeout=20, retries={"max_attempts": 2})
@@ -55,10 +55,24 @@ _cloudwatch = boto3.client(
     config=_boto_config,
 )
 
-# CloudWatch metric configuration — no hardcoded instance names or IDs
-_NAMESPACE = "CostOptimizerAgent"
-_METRICS = ["CpuUtilizationPercent", "LatencyMs"]
-_DATAPOINTS = 3  # last N data points requested per metric
+_DATAPOINTS = 3  # last N data points per metric
+
+# ---------------------------------------------------------------------------
+# All 9 CloudWatch metrics to collect
+# Each entry: (cloudwatch_metric_name, stat, query_id)
+# ---------------------------------------------------------------------------
+
+_METRIC_SPECS = [
+    ("CPUUtilization",    "Average", "cpu_utilization"),
+    ("DiskReadBytes",     "Sum",     "disk_read_bytes"),
+    ("DiskReadOps",       "Sum",     "disk_read_ops"),
+    ("DiskWriteBytes",    "Sum",     "disk_write_bytes"),
+    ("DiskWriteOps",      "Sum",     "disk_write_ops"),
+    ("NetworkIn",         "Sum",     "network_in"),
+    ("NetworkOut",        "Sum",     "network_out"),
+    ("NetworkPacketsIn",  "Sum",     "network_packets_in"),
+    ("NetworkPacketsOut", "Sum",     "network_packets_out"),
+]
 
 
 # ---------------------------------------------------------------------------
@@ -68,30 +82,36 @@ _DATAPOINTS = 3  # last N data points requested per metric
 def observe_all() -> dict:
     """
     Read the current state of all EC2 instances tagged project=cost-optimizer-agent
-    and retrieve the last 3 CloudWatch metric data points for each instance.
+    and retrieve the last 3 data points for all 9 CloudWatch metrics per instance.
 
     Returns:
         {
             "instances": [
                 {
-                    "id":            str,   # EC2 instance ID
-                    "name":          str,   # Value of the Name tag (or "")
+                    "id":            str,
+                    "name":          str,
                     "instance_type": str,
-                    "status":        str,   # e.g. "running", "stopped"
-                    "tags":          dict,  # {key: value, ...}
+                    "status":        str,
+                    "tags":          dict,
                     "metrics": {
-                        "CpuUtilizationPercent": [float, ...],  # up to 3 points
-                        "LatencyMs":             [float, ...]
+                        "CPUUtilization":    [float, ...],
+                        "DiskReadBytes":     [float, ...],
+                        "DiskReadOps":       [float, ...],
+                        "DiskWriteBytes":    [float, ...],
+                        "DiskWriteOps":      [float, ...],
+                        "NetworkIn":         [float, ...],
+                        "NetworkOut":        [float, ...],
+                        "NetworkPacketsIn":  [float, ...],
+                        "NetworkPacketsOut": [float, ...]
                     }
                 },
                 ...
             ]
         }
 
-    Raises:
-        Any boto3 / botocore exception is propagated unhandled to the caller.
+    EC2 exceptions propagate to the Orchestrator's try/except.
+    CloudWatch failures per instance return an empty metrics dict.
     """
-    # Step 1: Describe EC2 instances filtered by the project tag
     ec2_response = _ec2.describe_instances(
         Filters=[{"Name": "tag:project", "Values": ["cost-optimizer-agent"]}]
     )
@@ -100,28 +120,28 @@ def observe_all() -> dict:
 
     for reservation in ec2_response.get("Reservations", []):
         for raw in reservation.get("Instances", []):
-            # Extract flat tag dict {key: value}
             raw_tags = raw.get("Tags") or []
             tags = {t["Key"]: t["Value"] for t in raw_tags}
 
-            instance_id = raw["InstanceId"]
-            name = tags.get("Name", "")
+            instance_id   = raw["InstanceId"]
+            name          = tags.get("Name", "")
             instance_type = raw.get("InstanceType", "")
-            status = raw.get("State", {}).get("Name", "")
+            status        = raw.get("State", {}).get("Name", "")
 
-            # Step 2: Fetch real AWS CloudWatch metrics for this instance
-            metrics = _fetch_real_aws_metrics(instance_id)
+            # Skip terminated and shutting-down instances entirely
+            if status.lower() in ("terminated", "shutting-down"):
+                continue
 
-            instances.append(
-                {
-                    "id": instance_id,
-                    "name": name,
-                    "instance_type": instance_type,
-                    "status": status,
-                    "tags": tags,
-                    "metrics": metrics,
-                }
-            )
+            metrics = _fetch_metrics(instance_id)
+
+            instances.append({
+                "id":            instance_id,
+                "name":          name,
+                "instance_type": instance_type,
+                "status":        status,
+                "tags":          tags,
+                "metrics":       metrics,
+            })
 
     return {"instances": instances}
 
@@ -130,118 +150,57 @@ def observe_all() -> dict:
 # Internal helpers
 # ---------------------------------------------------------------------------
 
-def _fetch_real_aws_metrics(instance_id: str) -> dict:
+def _fetch_metrics(instance_id: str) -> dict:
     """
-    Retrieve real AWS CloudWatch metrics for an EC2 instance.
-    
-    Gets the last 3 data points for CPU utilization and network traffic.
-    AWS provides these metrics by default for all EC2 instances.
-    
-    Args:
-        instance_id: The EC2 instance ID (e.g., "i-1234567890abcdef0").
-        
-    Returns:
-        {"CpuUtilizationPercent": [float, ...], "NetworkPacketsIn": [float, ...]}
+    Fetch the last _DATAPOINTS data points for all 9 metrics from AWS/EC2
+    namespace, dimensioned by InstanceId with a 300-second period.
+
+    Returns a dict with all 9 metric names as keys and list[float] as values.
+    Returns all empty lists if CloudWatch raises.
     """
-    end_time = datetime.now(tz=timezone.utc)
-    # Look back 1 hour to get recent data points
+    end_time   = datetime.now(tz=timezone.utc)
     start_time = end_time - timedelta(hours=1)
-    
-    # AWS built-in EC2 metrics - CPU and Disk only
-    metric_queries = [
+
+    queries = [
         {
-            "Id": "cpu_utilization",
+            "Id": query_id,
             "MetricStat": {
                 "Metric": {
-                    "Namespace": "AWS/EC2",
-                    "MetricName": "CPUUtilization",
-                    "Dimensions": [
-                        {"Name": "InstanceId", "Value": instance_id}
-                    ],
-                },
-                "Period": 300,  # 5-minute periods (standard for AWS/EC2)
-                "Stat": "Average",
-            },
-            "ReturnData": True,
-        },
-        {
-            "Id": "disk_read_bytes",
-            "MetricStat": {
-                "Metric": {
-                    "Namespace": "AWS/EC2",
-                    "MetricName": "DiskReadBytes",
-                    "Dimensions": [
-                        {"Name": "InstanceId", "Value": instance_id}
-                    ],
+                    "Namespace":  "AWS/EC2",
+                    "MetricName": metric_name,
+                    "Dimensions": [{"Name": "InstanceId", "Value": instance_id}],
                 },
                 "Period": 300,
-                "Stat": "Sum",
-            },
-            "ReturnData": True,
-        },
-        {
-            "Id": "disk_write_bytes",
-            "MetricStat": {
-                "Metric": {
-                    "Namespace": "AWS/EC2",
-                    "MetricName": "DiskWriteBytes", 
-                    "Dimensions": [
-                        {"Name": "InstanceId", "Value": instance_id}
-                    ],
-                },
-                "Period": 300,
-                "Stat": "Sum",
+                "Stat":   stat,
             },
             "ReturnData": True,
         }
+        for metric_name, stat, query_id in _METRIC_SPECS
     ]
-    
+
+    # Build empty result keyed by metric name — filled in below
+    result = {metric_name: [] for metric_name, _, _ in _METRIC_SPECS}
+
     try:
-        cw_response = _cloudwatch.get_metric_data(
-            MetricDataQueries=metric_queries,
+        response = _cloudwatch.get_metric_data(
+            MetricDataQueries=queries,
             StartTime=start_time,
             EndTime=end_time,
             ScanBy="TimestampDescending",
         )
-        
-        result = {
-            "CpuUtilizationPercent": [], 
-            "DiskReadBytes": [],
-            "DiskWriteBytes": []
-        }
-        
-        for metric_result in cw_response.get("MetricDataResults", []):
+
+        # Build a lookup: query_id → metric_name
+        id_to_name = {qid: mname for mname, _, qid in _METRIC_SPECS}
+
+        for metric_result in response.get("MetricDataResults", []):
+            qid    = metric_result["Id"]
             values = list(reversed(metric_result.get("Values", [])))
-            limited_values = values[-_DATAPOINTS:] if len(values) > _DATAPOINTS else values
-            
-            if metric_result["Id"] == "cpu_utilization":
-                result["CpuUtilizationPercent"] = limited_values
-            elif metric_result["Id"] == "disk_read_bytes":
-                result["DiskReadBytes"] = limited_values
-            elif metric_result["Id"] == "disk_write_bytes":
-                result["DiskWriteBytes"] = limited_values
-                
-        return result
-        
+            limited = values[-_DATAPOINTS:] if len(values) > _DATAPOINTS else values
+            metric_name = id_to_name.get(qid)
+            if metric_name:
+                result[metric_name] = limited
+
     except Exception:
-        # If CloudWatch query fails, return empty metrics
-        return {"CpuUtilizationPercent": [], "DiskReadBytes": [], "DiskWriteBytes": []}
+        pass  # return all-empty on CloudWatch failure
 
-
-def _safe_id(metric_name: str) -> str:
-    """
-    Convert a metric name to a valid CloudWatch query ID.
-    Query IDs must start with a lowercase letter and contain only
-    alphanumeric characters and underscores.
-    """
-    return metric_name[0].lower() + metric_name[1:].replace("-", "_")
-
-
-def _id_to_metric(query_id: str) -> str:
-    """Reverse the _safe_id transformation to recover the original metric name."""
-    # _METRICS index lookup: find the metric whose safe_id matches
-    for name in _METRICS:
-        if _safe_id(name) == query_id:
-            return name
-    # Fallback: return the id as-is (should never happen with well-defined _METRICS)
-    return query_id
+    return result

@@ -2,7 +2,7 @@
 
 ## Overview
 
-Build an autonomous observe–decide–act loop that monitors live AWS EC2 instances, calls Claude once per cycle to decide what infrastructure action to take, executes real boto3 calls, persists all decisions to SQLite, and exposes a REST API. All source files live in `Agent/`. Tasks are ordered foundation-first: scaffolding → data layer → API server → observer → safety filter → LLM module → validator → executor → orchestrator → publisher → AWS provisioning → smoke tests → integration verification.
+Build an autonomous observe–decide–act loop that monitors live AWS EC2 instances, calls the Groq LLM (llama-3.3-70b-versatile) once per cycle to decide what infrastructure action to take, executes real boto3 calls, persists all decisions to SQLite, and exposes a REST API. All source files live in `Agent/`. Tasks are ordered foundation-first: scaffolding → data layer → API server → observer → safety filter → LLM module → validator → executor → orchestrator → publisher → AWS provisioning → smoke tests → integration verification.
 
 ---
 
@@ -16,12 +16,12 @@ Build an autonomous observe–decide–act loop that monitors live AWS EC2 insta
   - _Requirements: 1.7, 13.4_
 
 - [x] 1.2 Create `.env.example` in `Agent/`
-  - Include placeholder keys: `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_DEFAULT_REGION=us-east-1`, `ANTHROPIC_API_KEY`, `DB_URL=sqlite:///./audit.db`, `POLL_INTERVAL=10`, `API_HOST=0.0.0.0`, `API_PORT=8000`
+  - Include placeholder keys: `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_DEFAULT_REGION=us-east-1`, `GROQ_API_KEY`, `DB_URL=sqlite:///./audit.db`, `POLL_INTERVAL=480`, `API_HOST=0.0.0.0`, `API_PORT=8000`, `API_BASE_URL=http://localhost:8000`
   - Must never contain real credentials
   - _Requirements: 13.1, 13.2_
 
 - [x] 1.3 Create `Agent/requirements.txt` with pinned versions
-  - Include: `boto3==1.34.69`, `anthropic==0.25.1`, `fastapi==0.110.1`, `uvicorn==0.29.0`, `sqlalchemy==2.0.29`, `pydantic==2.6.4`, `python-dotenv==1.0.1`
+  - Include: `boto3==1.34.69`, `groq==0.11.0`, `httpx==0.27.2`, `fastapi==0.110.1`, `uvicorn==0.29.0`, `sqlalchemy==2.0.29`, `pydantic==2.6.4`, `python-dotenv==1.0.1`, `PyQt6==6.7.0`, `pyqtgraph==0.13.7`
   - Verify `pip install -r requirements.txt` resolves without conflicts
   - _Requirements: 14.1, 14.2, 14.3_
 
@@ -83,7 +83,10 @@ Build an autonomous observe–decide–act loop that monitors live AWS EC2 insta
   - Implement `GET /api/cost` → derive `running_count`, `stopped_count`, and `estimated_hourly_usd` from instance data; return `CostSummarySchema`
   - Implement `GET /api/killswitch` → read most recent kill_switch row, return `KillSwitchSchema`
   - Implement `POST /api/killswitch` → accept `{"active": bool}` body, insert new `KillSwitch` row, return updated `KillSwitchSchema`
-  - _Requirements: 3.1, 3.2, 3.3, 3.4, 3.5, 3.7_
+  - Implement `GET /api/metrics` → call `observe_all()` live and return current CloudWatch metrics per instance
+  - Implement `POST /api/instances/{instance_id}/stop` → manually stop the specified instance via boto3
+  - Implement `POST /api/instances/{instance_id}/start` → manually start the specified instance via boto3
+  - _Requirements: 3.1, 3.2, 3.3, 3.4, 3.5, 3.6, 3.7, 3.8_
 
 - [x] 3.2 Implement `Agent/main.py` — FastAPI app entry point
   - Create `FastAPI` app with `title="Cost Optimizer Agent API"`
@@ -100,14 +103,15 @@ Build an autonomous observe–decide–act loop that monitors live AWS EC2 insta
 
 - [x] 4.1 Implement `Agent/observer.py` — AWS state reader
   - Load AWS credentials and `AWS_DEFAULT_REGION` from `.env` via `python-dotenv`; raise `EnvironmentError` if any required key is missing
-  - Build boto3 `ec2` and `cloudwatch` clients using environment credentials
+  - Build boto3 `ec2` client and a boto3 `cloudwatch` client configured with `botocore.config.Config(connect_timeout=10, read_timeout=20, retries={"max_attempts": 2})`
   - Implement `observe_all() -> dict`:
     - Call `ec2.describe_instances(Filters=[{"Name": "tag:project", "Values": ["cost-optimizer-agent"]}])`
     - For each discovered instance, extract: `id`, `name` (from Name tag), `instance_type`, `status`, `tags` (as dict)
-    - Call `cloudwatch.get_metric_data()` for each instance requesting last 3 data points of `CpuUtilizationPercent` and `LatencyMs` in namespace `CostOptimizerAgent`, dimensioned by instance name
+    - Call `cloudwatch.get_metric_data()` for each instance requesting `CPUUtilization`, `DiskReadBytes`, and `DiskWriteBytes` from the `AWS/EC2` namespace, dimensioned by `InstanceId`, with a 300-second period
+    - If CloudWatch raises for a given instance, return an empty metrics dict `{}` for that instance (do not propagate)
     - Return `{"instances": [...]}` dict
-    - Propagate any boto3 exception unhandled to the caller
-  - _Requirements: 5.1, 5.2, 5.3, 5.4, 5.5_
+    - Propagate any EC2 boto3 exception unhandled to the caller
+  - _Requirements: 5.1, 5.2, 5.3, 5.4, 5.5, 5.6_
 
 - [ ]* 4.2 Write property test for observer metric coverage
   - **Property 14: Observer Metric Coverage** — for any set of N instances returned by a mock `ec2.describe_instances()`, `observe_all()` fetches CloudWatch metrics for all N instances
@@ -144,19 +148,20 @@ Build an autonomous observe–decide–act loop that monitors live AWS EC2 insta
 
 ### 6. LLM Module
 
-- [x] 6.1 Implement `Agent/llm.py` — Claude decision module
-  - Load `ANTHROPIC_API_KEY` from `.env` via `python-dotenv`; raise `EnvironmentError` if missing
+- [x] 6.1 Implement `Agent/llm.py` — Groq decision module
+  - Load `GROQ_API_KEY` from `.env` via `python-dotenv`; raise `EnvironmentError` if missing
   - Implement `call_llm(state: dict, eligible_ids: list[str], history: list[dict]) -> list[dict]`:
-    - Build the prompt string with: system instruction, `ELIGIBLE INSTANCE IDs` section listing `eligible_ids`, `CURRENT STATE` section with `json.dumps(state, indent=2)`, `RECENT ACTION HISTORY` section with `json.dumps(history, indent=2)`, and instruction to respond with ONLY a valid JSON array where each element has `tool`, `instance_id`, `reasoning`
-    - Make exactly one call to `anthropic.Anthropic().messages.create()` using model `claude-sonnet-4-5` (or latest available claude-sonnet-4 model per project spec `claude-sonnet-4-6`)
+    - Build a compact summary prompt: compute average `CPUUtilization`, `DiskReadBytes`, `DiskWriteBytes` per instance from `state`; include only the last 10 records from `history`
+    - Build the prompt string with: system instruction, `ELIGIBLE INSTANCE IDs` section listing `eligible_ids`, `CURRENT STATE SUMMARY` section with the compact per-instance summary, `RECENT ACTION HISTORY` section with the last 10 history records, and instruction to respond with ONLY a valid JSON array where each element has `tool`, `instance_id`, `reasoning`
+    - Make exactly one call to `groq.Groq().chat.completions.create()` using model `llama-3.3-70b-versatile`
     - Strip leading/trailing whitespace and markdown code fences (` ```json ` / ` ``` `) from the response text
     - Parse with `json.loads()`; if parsing fails raise `ValueError` with the raw response text included in the message
     - Return the parsed list of action dicts
-  - _Requirements: 7.1, 7.2, 7.3, 7.4, 7.5, 7.6_
+  - _Requirements: 7.1, 7.2, 7.3, 7.4, 7.5, 7.6, 7.7_
 
 - [ ]* 6.2 Write property test for single LLM call invariant
-  - **Property 7: Single LLM Call Per Cycle Invariant** — for any invocation of `call_llm()`, exactly one call is made to the Anthropic API regardless of state size
-  - Mock the Anthropic client; count calls
+  - **Property 7: Single LLM Call Per Cycle Invariant** — for any invocation of `call_llm()`, exactly one call is made to the Groq API regardless of state size
+  - Mock the Groq client; count calls
   - **Validates: Requirements 7.2**
 
 
@@ -262,7 +267,8 @@ Build an autonomous observe–decide–act loop that monitors live AWS EC2 insta
     - Each iteration: call `_current_phase(cycle)`, then for each instance name and each metric, call `cw.put_metric_data()` with `Namespace=NAMESPACE`, `MetricData` containing `MetricName`, `Dimensions=[{"Name": "InstanceName", "Value": name}]`, `Value`, `Unit="None"`
     - Increment cycle; `time.sleep(PUBLISH_INTERVAL)`
   - Instance names are passed in at runtime — no hardcoded names inside the module
-  - _Requirements: 4.1, 4.2, 4.3, 4.4, 4.5, 4.6_
+  - **Note:** The Publisher is now optional/legacy. The Observer reads `AWS/EC2` native metrics (`CPUUtilization`, `DiskReadBytes`, `DiskWriteBytes`) directly — it no longer reads from the `CostOptimizerAgent` namespace. The Publisher's `if __name__ == "__main__":` entry point discovers instances directly via EC2 (not by calling `observe_all()`)
+  - _Requirements: 4.1, 4.2, 4.3, 4.4, 4.5, 4.6, 4.7_
 
 - [ ]* 10.2 Write property test for publisher phase-to-metric consistency
   - **Property 12: Publisher Phase-to-Metric Consistency** — for any cycle count `n`, `_current_phase(n)` returns phase 0 values for `n < 10`, phase 1 values for `10 ≤ n < 20`, and phase 2 values for `n ≥ 20`
@@ -280,14 +286,11 @@ Build an autonomous observe–decide–act loop that monitors live AWS EC2 insta
 ### 11. AWS Provisioning Script
 
 - [x] 11.1 Implement `Agent/setup_aws.py` — one-time AWS infrastructure provisioner
-  - Load root-level AWS credentials (separate from the agent user) from environment at script start
+  - Load AWS credentials from `Agent/.env` directly at script start (uses existing credentials — no IAM user creation)
   - Launch exactly 4 `t3.micro` EC2 instances: `web-1`, `web-2`, `worker-1`, `cache-1`
   - Apply tag `project=cost-optimizer-agent` to all four instances immediately after launch
   - Apply tag `protected=true` to `cache-1`; apply `protected=false` to `web-1`, `web-2`, `worker-1`
-  - Create IAM user named `cost-optimizer-agent`
-  - Attach an inline IAM policy granting exactly these 7 actions: `ec2:DescribeInstances`, `ec2:StartInstances`, `ec2:StopInstances`, `ec2:ModifyInstanceAttribute`, `ec2:CreateTags`, `cloudwatch:GetMetricData`, `cloudwatch:PutMetricData`
-  - Generate an access key for the IAM user
-  - Write `AWS_ACCESS_KEY_ID=<key>` and `AWS_SECRET_ACCESS_KEY=<secret>` into `.env` in the project root — merge with existing keys without overwriting other entries
+  - Wait for all instances to reach the `running` state before exiting
   - Print a summary of all created resources on success
   - _Requirements: 1.1, 1.2, 1.3, 1.4, 1.5, 1.6, 1.7_
 
@@ -350,26 +353,26 @@ Build an autonomous observe–decide–act loop that monitors live AWS EC2 insta
 
 ---
 
-### 14. Terminal Dashboard (Textual UI)
+### 14. Terminal Dashboard (PyQt6 GUI)
 
 - [ ] 14.1 Implement `Agent/dashboard.py` — PyQt6 GUI dashboard
-  - Add `PyQt6==6.7.0` and `pyqtgraph==0.13.7` to `Agent/requirements.txt`
+  - `PyQt6==6.7.0` and `pyqtgraph==0.13.7` are included in `Agent/requirements.txt`
   - Create a `CostOptimizerDashboard` class subclassing `QMainWindow`
   - Window title: "Cost Optimizer Agent — Live Dashboard"; default size: 1400x800
   - Use `QTabWidget` with three tabs:
-    - **Tab 1 — Instances**: `QTableWidget` showing all instances with columns: `Name`, `Type`, `Status`, `Protected`, `Last Action`, `CPU Utilization (last 3)`, `Latency ms (last 3)`, `Updated At`; running rows highlighted green, stopped rows red
+    - **Tab 1 — Instances**: `QTableWidget` showing all instances with columns: `Name`, `Type`, `Status`, `Protected`, `Last Action`, `CPU Utilization`, `Disk Read Bytes`, `Disk Write Bytes`, `Updated At`; running rows highlighted green, stopped rows red
     - **Tab 2 — Cycles**: `QTableWidget` showing last 50 cycle records with columns: `Cycle #`, `Timestamp`, `Instance`, `Action`, `Reasoning`, `Validated`, `AWS Response`
     - **Tab 3 — Metrics & Cost**: split into two sections:
       - Top: cost summary cards showing `Total Instances`, `Running`, `Stopped`, `Est. Hourly USD` as large bold `QLabel` widgets in a `QHBoxLayout`
       - Bottom: two live `pyqtgraph` `PlotWidget` charts — one for CPU utilization per instance (line chart, last 20 data points) and one for Latency ms per instance (line chart, last 20 data points); each instance gets its own colored line
   - Kill switch control: a `QGroupBox` in the main toolbar area showing current state and a `QPushButton` to toggle via `POST /api/killswitch`; button turns red when active, green when inactive
   - Status bar (`QStatusBar`): shows last poll time, instance count, and API errors in red
-  - Auto-refresh every 3 seconds using `QTimer`
+  - Auto-refresh every 3 seconds using `QTimer`; API calls run in a background `QThread` to keep UI responsive
   - All API base URL read from environment variable `API_BASE_URL` (default `http://localhost:8000`)
   - Use `httpx` (sync) for all API calls — no direct DB or boto3 imports
   - Maintain a rolling history of up to 20 data points per instance for chart plotting
   - Add `if __name__ == "__main__":` guard
-  - _Requirements: 3.1, 3.2, 3.3, 3.4, 3.5_
+  - _Requirements: 16.1, 16.2, 16.3, 16.4, 16.5, 16.6, 16.7, 16.8, 16.9, 16.10_
 
 - [ ] 14.2 Checkpoint — dashboard
   - Install: `uv pip install -r requirements.txt`
@@ -387,7 +390,7 @@ Build an autonomous observe–decide–act loop that monitors live AWS EC2 insta
 - The LLM is the **only** decision-maker; no `if/else` logic in any Python file may decide which action to apply to an instance
 - `cache-1` is protected exclusively via the `protected=true` tag check in `safety.py` — its name is never hardcoded
 - The orchestrator loop must never exit; every cycle is wrapped in `try/except` + `continue`
-- Property tests use in-memory SQLite (`sqlite:///:memory:`) or mocked boto3/Anthropic clients — no live AWS calls required
+- Property tests use in-memory SQLite (`sqlite:///:memory:`) or mocked boto3/Groq clients — no live AWS calls required
 - Checkpoints validate incremental progress before moving to the next layer
 
 

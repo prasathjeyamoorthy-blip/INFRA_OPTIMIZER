@@ -10,7 +10,7 @@ The Cost Optimizer Agent is an autonomous observe–decide–act system that mon
 - **Orchestrator**: The main control loop that sequences each observe–decide–act cycle.
 - **Observer**: The module that reads EC2 instance state and CloudWatch metrics from AWS.
 - **Safety Filter**: The module (`safety.py`) that produces the eligible-instance list before any LLM call.
-- **LLM**: The Claude claude-sonnet-4-6 language model used as the sole decision-maker.
+- **LLM**: The Groq llama-3.3-70b-versatile language model used as the sole decision-maker.
 - **Validator**: The module that checks LLM output against allowed tools and eligible instances.
 - **Executor**: The module that dispatches validated actions to boto3 calls.
 - **Publisher**: The synthetic CloudWatch metric publisher (`publisher.py`).
@@ -42,8 +42,8 @@ The Cost Optimizer Agent is an autonomous observe–decide–act system that mon
 2. WHEN `setup_aws.py` creates an EC2 instance, THE script SHALL apply the tag `project=cost-optimizer-agent` to that instance.
 3. WHEN `setup_aws.py` creates the `cache-1` instance, THE script SHALL also apply the tag `protected=true` to that instance.
 4. WHEN `setup_aws.py` creates any instance whose name is not `cache-1`, THE script SHALL apply the tag `protected=false` to that instance.
-5. THE `setup_aws.py` script SHALL create an IAM user with permissions scoped to exactly: `ec2:DescribeInstances`, `ec2:StartInstances`, `ec2:StopInstances`, `ec2:ModifyInstanceAttribute`, `ec2:CreateTags`, `cloudwatch:GetMetricData`, and `cloudwatch:PutMetricData`.
-6. WHEN `setup_aws.py` creates the IAM user credentials, THE script SHALL write `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY` into a `.env` file in the project root.
+5. THE `setup_aws.py` script SHALL load existing AWS credentials from `Agent/.env` directly (no IAM user creation).
+6. THE `setup_aws.py` script SHALL wait for all launched instances to reach the `running` state before exiting.
 7. THE `.env` file SHALL never be committed to version control; THE project SHALL include `.env` in `.gitignore`.
 
 ---
@@ -76,15 +76,18 @@ The Cost Optimizer Agent is an autonomous observe–decide–act system that mon
 3. THE API Server SHALL expose `GET /api/cost` returning a cost summary derived from current instance data.
 4. THE API Server SHALL expose `GET /api/killswitch` returning the current kill-switch state.
 5. THE API Server SHALL expose `POST /api/killswitch` accepting a JSON body that sets the kill-switch `active` field and persisting the change to the `kill_switch` table.
-6. THE API Server SHALL enable CORS for all origins on all routes.
-7. WHEN a request is received by the API Server, THE API Server SHALL respond within 2 seconds under normal database load.
-8. THE API Server SHALL be launched via `main.py` using uvicorn and SHALL read its configuration from `.env`.
+6. THE API Server SHALL expose `GET /api/metrics` that calls `observe_all()` live and returns current CloudWatch metrics per instance.
+7. THE API Server SHALL expose `POST /api/instances/{instance_id}/stop` that manually triggers a stop action for the specified instance.
+8. THE API Server SHALL expose `POST /api/instances/{instance_id}/start` that manually triggers a start action for the specified instance.
+9. THE API Server SHALL enable CORS for all origins on all routes.
+10. WHEN a request is received by the API Server, THE API Server SHALL respond within 2 seconds under normal database load.
+11. THE API Server SHALL be launched via `main.py` using uvicorn and SHALL read its configuration from `.env`.
 
 ---
 
 ### Requirement 4: Synthetic Metric Publisher
 
-**User Story:** As a developer testing the agent without real workloads, I want a publisher that pushes synthetic CloudWatch metrics on a fixed interval, so that the Observer always has data to read.
+**User Story:** As a developer testing the agent without real workloads, I want a publisher that pushes synthetic CloudWatch metrics on a fixed interval, so that there is supplementary metric data in the `CostOptimizerAgent` namespace.
 
 #### Acceptance Criteria
 
@@ -94,6 +97,7 @@ The Cost Optimizer Agent is an autonomous observe–decide–act system that mon
 4. THE Publisher SHALL push metrics every 10 seconds regardless of the Orchestrator's POLL_INTERVAL.
 5. WHEN the Publisher pushes a metric, THE Publisher SHALL include the instance name as a CloudWatch dimension.
 6. THE Publisher SHALL read AWS credentials from `.env` via `python-dotenv`.
+7. NOTE: The Publisher is now decoupled from the Observer. The Observer reads AWS/EC2 native metrics (`CPUUtilization`, `DiskReadBytes`, `DiskWriteBytes` from the `AWS/EC2` namespace); the Publisher continues to write to the `CostOptimizerAgent` namespace as a legacy/supplementary publisher. The Publisher discovers instances directly via EC2 at startup rather than calling `observe_all()`.
 
 ---
 
@@ -105,9 +109,10 @@ The Cost Optimizer Agent is an autonomous observe–decide–act system that mon
 
 1. THE Observer SHALL expose an `observe_all() -> dict` function.
 2. WHEN `observe_all()` is called, THE Observer SHALL call `ec2.describe_instances()` filtered by the tag `project=cost-optimizer-agent`.
-3. WHEN `observe_all()` is called, THE Observer SHALL call `cloudwatch.get_metric_data()` to retrieve the last 3 data points for each tracked metric for each discovered instance.
-4. THE Observer SHALL read AWS credentials and region from `.env`.
+3. WHEN `observe_all()` is called, THE Observer SHALL call `cloudwatch.get_metric_data()` to retrieve the most recent data points for `CPUUtilization`, `DiskReadBytes`, and `DiskWriteBytes` from the `AWS/EC2` namespace, dimensioned by `InstanceId`, with a period of 300 seconds.
+4. THE Observer SHALL read AWS credentials and region from `.env` and SHALL configure CloudWatch with `connect_timeout=10`, `read_timeout=20`, and `max_attempts=2`.
 5. IF `ec2.describe_instances()` raises a boto3 exception, THEN THE Observer SHALL propagate the exception to the Orchestrator for handling within the cycle's try/except block.
+6. IF `cloudwatch.get_metric_data()` raises a boto3 exception for a given instance, THEN THE Observer SHALL return an empty metrics dict for that instance rather than propagating the error.
 
 ---
 
@@ -127,16 +132,17 @@ The Cost Optimizer Agent is an autonomous observe–decide–act system that mon
 
 ### Requirement 7: LLM Decision Module
 
-**User Story:** As the Orchestrator, I want a single function that sends the current state to Claude and returns a structured action list, so that all decision logic stays in one place.
+**User Story:** As the Orchestrator, I want a single function that sends the current state to the LLM and returns a structured action list, so that all decision logic stays in one place.
 
 #### Acceptance Criteria
 
 1. THE LLM module SHALL expose a `call_llm(state: dict, eligible_ids: list, history: list) -> list[dict]` function.
-2. WHEN `call_llm` is invoked, THE LLM module SHALL make exactly one API call to Claude claude-sonnet-4-6 per cycle.
-3. THE LLM module SHALL instruct Claude to return a JSON array and nothing else.
+2. WHEN `call_llm` is invoked, THE LLM module SHALL make exactly one API call to Groq `llama-3.3-70b-versatile` per cycle.
+3. THE LLM module SHALL instruct the model to return a JSON array and nothing else.
 4. WHEN the LLM response contains markdown code fences, THE LLM module SHALL strip those fences before parsing the JSON.
-5. THE LLM module SHALL read the `ANTHROPIC_API_KEY` from `.env`.
-6. IF Claude returns a response that cannot be parsed as a JSON array, THEN THE LLM module SHALL raise a `ValueError` for the Orchestrator's try/except to handle.
+5. THE LLM module SHALL read the `GROQ_API_KEY` from `.env`.
+6. IF the model returns a response that cannot be parsed as a JSON array, THEN THE LLM module SHALL raise a `ValueError` for the Orchestrator's try/except to handle.
+7. THE LLM module SHALL send a compact summary prompt — including average CPU%, DiskReadBytes, DiskWriteBytes per instance and the last 10 history records only — rather than the full raw state JSON, in order to minimize token usage.
 
 ---
 
@@ -220,10 +226,11 @@ The Cost Optimizer Agent is an autonomous observe–decide–act system that mon
 
 #### Acceptance Criteria
 
-1. THE Agent system SHALL read `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_DEFAULT_REGION`, `ANTHROPIC_API_KEY`, `DB_URL`, and `POLL_INTERVAL` exclusively from `.env` via `python-dotenv`.
+1. THE Agent system SHALL read `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_DEFAULT_REGION`, `GROQ_API_KEY`, `DB_URL`, `POLL_INTERVAL`, and optionally `API_BASE_URL` exclusively from `.env` via `python-dotenv`.
 2. THE Agent system SHALL contain zero hardcoded credential values, instance names, instance IDs, region strings, or API keys in any Python source file.
 3. IF a required environment variable is missing at startup, THEN THE affected module SHALL raise a clear `EnvironmentError` or `KeyError` identifying the missing variable.
 4. THE `.env` file SHALL be listed in `.gitignore` and SHALL never be committed to version control.
+5. ALL modules SHALL load `.env` using `load_dotenv(dotenv_path=Path(__file__).resolve().parent / ".env")` pointing to `Agent/.env`.
 
 ---
 
@@ -234,7 +241,7 @@ The Cost Optimizer Agent is an autonomous observe–decide–act system that mon
 #### Acceptance Criteria
 
 1. THE project SHALL include a `requirements.txt` file in the `Agent/` directory listing all runtime dependencies with exact pinned versions (using `==`).
-2. THE `requirements.txt` SHALL include at minimum: `boto3`, `anthropic`, `fastapi`, `uvicorn`, `sqlalchemy`, `pydantic`, `python-dotenv`.
+2. THE `requirements.txt` SHALL include at minimum: `boto3`, `groq`, `httpx`, `fastapi`, `uvicorn`, `sqlalchemy`, `pydantic`, `python-dotenv`, `PyQt6`, `pyqtgraph`.
 3. WHEN a developer runs `pip install -r requirements.txt`, THE installation SHALL complete without version conflicts.
 
 ---
@@ -252,3 +259,22 @@ The Cost Optimizer Agent is an autonomous observe–decide–act system that mon
 5. WHEN `test_smoke.py` tests `is_kill_switch_active`, THE script SHALL verify the function returns a boolean without connecting to a live database by using an in-memory SQLite database.
 6. WHEN all checks in `test_smoke.py` pass, THE script SHALL print a summary line confirming all tests passed and SHALL exit with code 0.
 7. WHEN any check in `test_smoke.py` fails, THE script SHALL print the failing assertion and SHALL exit with code 1.
+
+---
+
+### Requirement 16: Terminal Dashboard (PyQt6 GUI)
+
+**User Story:** As a system operator, I want a graphical desktop dashboard that displays live instance state, cycle history, cost metrics, and a kill switch control, so that I can monitor and manage the agent at a glance.
+
+#### Acceptance Criteria
+
+1. THE Dashboard SHALL be implemented as a PyQt6 `QMainWindow` application in `Agent/dashboard.py`.
+2. THE Dashboard SHALL present a `QTabWidget` with exactly three tabs: **Instances**, **Cycles**, and **Metrics & Cost**.
+3. THE **Instances** tab SHALL show a `QTableWidget` with columns: `Name`, `Type`, `Status`, `Protected`, `Last Action`, `CPU Utilization`, `Disk Read Bytes`, `Disk Write Bytes`, `Updated At`; rows for running instances SHALL be highlighted green, stopped instances red.
+4. THE **Cycles** tab SHALL show a `QTableWidget` with the last 50 cycle records, including columns: `Cycle #`, `Timestamp`, `Instance`, `Action`, `Reasoning`, `Validated`, `AWS Response`.
+5. THE **Metrics & Cost** tab SHALL display cost summary cards (`Total Instances`, `Running`, `Stopped`, `Est. Hourly USD`) and two live `pyqtgraph` line charts — one for CPU% per instance and one for Latency ms per instance — each rolling the last 20 data points.
+6. THE Dashboard SHALL include a kill switch `QPushButton` in the toolbar that turns red when active and green when inactive, toggling via `POST /api/killswitch`.
+7. THE Dashboard SHALL auto-refresh all tabs every 3 seconds using `QTimer`.
+8. THE Dashboard SHALL perform all API calls using `httpx` (sync) — no direct DB or boto3 imports.
+9. THE Dashboard SHALL read the API base URL from the `API_BASE_URL` environment variable (default `http://localhost:8000`).
+10. THE Dashboard SHALL use a background `QThread` for non-blocking API polling so the UI remains responsive.

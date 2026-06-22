@@ -2,7 +2,7 @@
 
 ## Overview
 
-The Cost Optimizer Agent is an autonomous observe–decide–act system composed of four concurrently running processes: the Orchestrator loop, the synthetic metric Publisher, the FastAPI/uvicorn API Server, and the SQLite database layer. All Python source files live in `Agent/`. The LLM (Claude claude-sonnet-4-6) is the sole decision-maker; no `if/else` logic in any module decides which action to apply to an instance.
+The Cost Optimizer Agent is an autonomous observe–decide–act system composed of four concurrently running processes: the Orchestrator loop, the synthetic metric Publisher, the FastAPI/uvicorn API Server, and the SQLite database layer. All Python source files live in `Agent/`. The LLM (Groq `llama-3.3-70b-versatile`) is the sole decision-maker; no `if/else` logic in any module decides which action to apply to an instance.
 
 ---
 
@@ -145,8 +145,9 @@ def observe_all() -> dict:
                     "status": str,
                     "tags": dict,
                     "metrics": {
-                        "CpuUtilizationPercent": [float, ...],  # last 3 points
-                        "LatencyMs":             [float, ...]
+                        "CPUUtilization":  [float, ...],  # AWS/EC2 native, 300s period
+                        "DiskReadBytes":   [float, ...],
+                        "DiskWriteBytes":  [float, ...]
                     }
                 },
                 ...
@@ -157,9 +158,11 @@ def observe_all() -> dict:
 
 Steps inside `observe_all()`:
 1. Build a boto3 EC2 client using credentials from environment.
-2. Call `ec2.describe_instances(Filters=[{"Name": "tag:project", "Values": ["cost-optimizer-agent"]}])`.
-3. For each discovered instance, call `cloudwatch.get_metric_data()` requesting the last 3 data points of `CpuUtilizationPercent` and `LatencyMs` in namespace `CostOptimizerAgent`, dimensioned by instance name.
-4. Return the assembled dict. Any boto3 exception propagates unhandled to the Orchestrator's `try/except`.
+2. Build a boto3 CloudWatch client configured with `botocore.config.Config(connect_timeout=10, read_timeout=20, retries={"max_attempts": 2})`.
+3. Call `ec2.describe_instances(Filters=[{"Name": "tag:project", "Values": ["cost-optimizer-agent"]}])`.
+4. For each discovered instance, call `cloudwatch.get_metric_data()` requesting `CPUUtilization`, `DiskReadBytes`, and `DiskWriteBytes` from the `AWS/EC2` namespace, dimensioned by `InstanceId`, with a 300-second period.
+5. If CloudWatch raises an exception for a given instance, return an empty metrics dict `{}` for that instance rather than propagating the error.
+6. Return the assembled dict. Any EC2 boto3 exception propagates unhandled to the Orchestrator's `try/except`.
 
 ---
 
@@ -187,19 +190,19 @@ Key design decisions:
 
 ---
 
-### `llm.py` — Claude Decision Module
+### `llm.py` — Groq Decision Module
 
 ```python
 def call_llm(state: dict, eligible_ids: list[str], history: list[dict]) -> list[dict]:
     """
-    Makes exactly one call to Claude claude-sonnet-4-6.
+    Makes exactly one call to Groq llama-3.3-70b-versatile.
     Returns a list of action dicts, e.g.:
         [{"tool": "stop_instance", "instance_id": "i-abc", "reasoning": "..."}]
     Raises ValueError if the response cannot be parsed as a JSON array.
     """
 ```
 
-Prompt structure sent to Claude:
+Prompt structure — compact summary to minimize token usage:
 
 ```
 You are an autonomous AWS cost-optimization agent.
@@ -210,17 +213,22 @@ required capacity.
 ELIGIBLE INSTANCE IDs (you may ONLY act on these):
 {eligible_ids}
 
-CURRENT STATE:
-{json.dumps(state, indent=2)}
+CURRENT STATE SUMMARY (avg CPU%, DiskReadBytes, DiskWriteBytes per instance):
+{compact_summary}   # dict of instance_id → {"cpu": avg, "disk_read": avg, "disk_write": avg}
 
-RECENT ACTION HISTORY (last 50 cycles):
-{json.dumps(history, indent=2)}
+RECENT ACTION HISTORY (last 10 cycles):
+{json.dumps(history[-10:], indent=2)}
 
 Respond with ONLY a valid JSON array. No markdown, no explanation.
 Each element must have: "tool", "instance_id", "reasoning".
 Available tools: stop_instance, start_instance, resize_instance,
                  tag_instance, do_nothing, alert_human.
 ```
+
+Key design decisions:
+- State is sent as a compact per-instance summary (avg CPU%, DiskReadBytes, DiskWriteBytes) rather than the full raw JSON, reducing token usage.
+- History is capped at the last 10 records rather than 50.
+- `GROQ_API_KEY` is read from `.env` and passed to the `groq.Groq()` client.
 
 Response handling:
 1. Strip leading/trailing whitespace and markdown code fences (` ```json ` ... ` ``` `).
@@ -381,6 +389,9 @@ def run():
 | GET | `/api/cost` | — | — | `CostSummarySchema` |
 | GET | `/api/killswitch` | — | — | `KillSwitchSchema` |
 | POST | `/api/killswitch` | — | `{"active": bool}` | `KillSwitchSchema` |
+| GET | `/api/metrics` | — | — | Live CloudWatch metrics per instance (calls `observe_all()`) |
+| POST | `/api/instances/{instance_id}/stop` | — | — | Manually stops the specified instance |
+| POST | `/api/instances/{instance_id}/start` | — | — | Manually starts the specified instance |
 
 All routes are registered with `CORSMiddleware(allow_origins=["*"])`.
 
@@ -490,19 +501,18 @@ def run(instance_names: list[str]):
         time.sleep(PUBLISH_INTERVAL)
 ```
 
-The publisher does not hardcode instance names — it receives them at runtime (e.g., by calling `observe_all()` once at startup or accepting them as arguments from `main.py`).
+**Decoupling note:** The Publisher is now decoupled from the Observer. The Observer reads `AWS/EC2` native metrics (`CPUUtilization`, `DiskReadBytes`, `DiskWriteBytes`) dimensioned by `InstanceId`. The Publisher continues to write to the `CostOptimizerAgent` namespace as a legacy/supplementary publisher. The Publisher's `if __name__ == "__main__":` entry point discovers instances directly via EC2 (not by calling `observe_all()`), then calls `run(instance_names)`.
+
+The publisher does not hardcode instance names — it receives them at runtime from the EC2 instance discovery step.
 
 ---
 
 ### `setup_aws.py` — One-Time Provisioning Script
 
-Sequence of operations:
-1. Launch 4 `t3.micro` instances with names `web-1`, `web-2`, `worker-1`, `cache-1`.
-2. Apply `project=cost-optimizer-agent` to all four.
-3. Apply `protected=true` to `cache-1`, `protected=false` to the other three.
-4. Create IAM user `cost-optimizer-agent` with inline policy granting only the 7 specified actions.
-5. Generate access key for the user.
-6. Write `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY` to `.env` in the project root (creating or updating the file without overwriting other keys).
+Simplified 3-step sequence of operations:
+1. Load AWS credentials from `Agent/.env` directly (uses existing credentials — no IAM user creation).
+2. Launch 4 `t3.micro` instances with names `web-1`, `web-2`, `worker-1`, `cache-1`; apply `project=cost-optimizer-agent` to all four; apply `protected=true` to `cache-1` and `protected=false` to the other three.
+3. Wait for all instances to reach the `running` state, then print a summary of created resources.
 
 ---
 
@@ -521,17 +531,46 @@ Tests run in order; any failure prints the assertion message and calls `sys.exit
 
 ---
 
+### `dashboard.py` — PyQt6 GUI Dashboard
+
+```python
+class CostOptimizerDashboard(QMainWindow):
+    """
+    Main window with three tabs, kill switch toolbar, QTimer auto-refresh,
+    and a background QThread for non-blocking API polling.
+    """
+```
+
+Layout overview:
+
+| Tab | Widget | Content |
+|---|---|---|
+| Instances | `QTableWidget` | `Name`, `Type`, `Status`, `Protected`, `Last Action`, `CPU Utilization`, `Disk Read Bytes`, `Disk Write Bytes`, `Updated At`; running rows = green, stopped rows = red |
+| Cycles | `QTableWidget` | Last 50 cycle records: `Cycle #`, `Timestamp`, `Instance`, `Action`, `Reasoning`, `Validated`, `AWS Response` |
+| Metrics & Cost | Cost cards + `pyqtgraph` charts | Cost summary cards (`Total`, `Running`, `Stopped`, `Est. Hourly USD`) + CPU% line chart + Latency ms line chart; each instance gets its own colored line; rolling 20-point window |
+
+Additional components:
+- **Kill switch widget**: `QGroupBox` in the toolbar with a `QPushButton` — red when active, green when inactive. Toggles state via `POST /api/killswitch`.
+- **Status bar** (`QStatusBar`): last poll time, instance count, API errors shown in red.
+- **Auto-refresh**: `QTimer` fires every 3 seconds; API calls run in a `QThread` to keep UI responsive.
+- **API client**: `httpx` (sync) — no direct DB or boto3 imports inside `dashboard.py`.
+- **API base URL**: read from `API_BASE_URL` environment variable; defaults to `http://localhost:8000`.
+- Chart history: up to 20 rolling data points per instance per metric.
+
+---
+
 ### `.env.example`
 
 ```
 AWS_ACCESS_KEY_ID=your_key_here
 AWS_SECRET_ACCESS_KEY=your_secret_here
 AWS_DEFAULT_REGION=us-east-1
-ANTHROPIC_API_KEY=your_anthropic_key_here
+GROQ_API_KEY=your_groq_key_here
 DB_URL=sqlite:///./audit.db
-POLL_INTERVAL=10
+POLL_INTERVAL=480
 API_HOST=0.0.0.0
 API_PORT=8000
+API_BASE_URL=http://localhost:8000
 ```
 
 ---
@@ -553,12 +592,15 @@ __pycache__/
 
 ```
 boto3==1.34.69
-anthropic==0.25.1
+groq==0.11.0
+httpx==0.27.2
 fastapi==0.110.1
 uvicorn==0.29.0
 sqlalchemy==2.0.29
 pydantic==2.6.4
 python-dotenv==1.0.1
+PyQt6==6.7.0
+pyqtgraph==0.13.7
 ```
 
 ---
@@ -570,7 +612,9 @@ python-dotenv==1.0.1
 ```
 observe_all()
     └─ ec2.describe_instances()        →  raw EC2 state
-    └─ cloudwatch.get_metric_data()    →  last 3 metric points per instance
+    └─ cloudwatch.get_metric_data()    →  AWS/EC2 native metrics (CPUUtilization, DiskReadBytes, DiskWriteBytes)
+                                           dimensioned by InstanceId; 300s period
+    └─ CloudWatch failures return empty metrics dict per instance (not propagated)
     └─ returns: state dict
 
 upsert_instance_snapshot() × N        →  instances table updated
@@ -583,7 +627,8 @@ filter_eligible_instances(state, history)
     └─ returns: eligible_ids list
 
 call_llm(state, eligible_ids, history)
-    └─ single Anthropic API call
+    └─ single Groq API call (llama-3.3-70b-versatile)
+    └─ compact prompt: avg CPU%, DiskReadBytes, DiskWriteBytes per instance; last 10 history records
     └─ returns: raw action list (unvalidated)
 
 validate_actions(llm_actions, state, eligible_ids)
@@ -607,7 +652,7 @@ write_cycle_records(records)           →  cycles table
 |---|---|---|
 | `observe_all()` | boto3 exception | Propagates to Orchestrator `try/except`; cycle is skipped |
 | `call_llm()` | Non-JSON response | Raises `ValueError`; caught by Orchestrator; cycle skipped after persistence of observed data |
-| `call_llm()` | Anthropic API error | Propagates; caught by Orchestrator |
+| `call_llm()` | Groq API error | Propagates; caught by Orchestrator |
 | `validate_actions()` | Unknown tool / bad ID | Silently dropped; no exception raised |
 | `TOOL_DISPATCH[fn]()` | boto3 exception | Each tool may raise; Orchestrator catches at cycle level |
 | `db.py` helpers | SQLAlchemy error | Propagates; Orchestrator catches |
@@ -636,11 +681,12 @@ For a production deployment these could be separate OS processes launched by a p
 
 ## Security Notes
 
-- IAM credentials are scoped to the minimum 7 actions (Requirement 1.5).
+- AWS credentials used by the agent are pre-existing and scoped to the required EC2 and CloudWatch actions.
 - All credentials are read from `.env`; never appear in source code.
 - `.env` and `audit.db` are in `.gitignore`.
 - The LLM is sandboxed: it can only suggest tools from `ALLOWED_TOOLS`; the Validator enforces this hard boundary before any boto3 call is made.
 - Protected instances are excluded before the LLM prompt is assembled, so the LLM never receives their IDs in `eligible_ids`.
+- `GROQ_API_KEY` is loaded from `.env`; never hardcoded.
 
 ---
 
@@ -698,7 +744,7 @@ For a production deployment these could be separate OS processes launched by a p
 
 ### Property 7: Single LLM Call Per Cycle Invariant
 
-*For any* invocation of `call_llm(state, eligible_ids, history)`, regardless of the size or content of `state`, exactly one call SHALL be made to the Anthropic API.
+*For any* invocation of `call_llm(state, eligible_ids, history)`, regardless of the size or content of `state`, exactly one call SHALL be made to the Groq API.
 
 **Validates: Requirements 7.2**
 

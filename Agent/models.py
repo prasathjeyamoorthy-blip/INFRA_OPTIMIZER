@@ -28,6 +28,7 @@ class Instance(Base):
     tags                  = Column(String)                         # JSON string
     last_action           = Column(String, nullable=True)
     last_action_reasoning = Column(String, nullable=True)
+    pending_resize        = Column(String, nullable=True)          # target type e.g. "t3.small"
     updated_at            = Column(DateTime, default=func.now(), onupdate=func.now())
 
 

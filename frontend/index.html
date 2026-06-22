@@ -140,7 +140,7 @@
         <div class="page-head-row">
           <div>
             <h2 class="page-title">Infrastructure</h2>
-            <span class="page-sub">12 instances across 3 regions</span>
+            <span class="page-sub" id="infraSubtitle">Loading instances...</span>
           </div>
           <div class="filter-row">
             <button class="chip-filter active" data-filter="all">All</button>
@@ -325,16 +325,16 @@
             <div class="panel-head"><h2>Operating limits</h2></div>
             <div class="limits-list">
               <div class="limit-row">
-                <span class="limit-label">Maximum actions per cycle</span>
-                <span class="mono limit-value">3</span>
+                <span class="limit-label">Maximum real actions per cycle</span>
+                <span class="mono limit-value">2</span>
               </div>
               <div class="limit-row">
-                <span class="limit-label">Cooldown period</span>
-                <span class="mono limit-value">15 min</span>
+                <span class="limit-label">Cooldown cycles after action</span>
+                <span class="mono limit-value">3 cycles</span>
               </div>
               <div class="limit-row">
-                <span class="limit-label">Protected tags</span>
-                <span class="mono limit-value">env:prod-critical, tier:payment</span>
+                <span class="limit-label">Protected tag key</span>
+                <span class="mono limit-value">protected=true</span>
               </div>
             </div>
           </div>

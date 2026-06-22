@@ -18,7 +18,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from api import router
-from db import init_db
+from db import init_db, sync_instances_from_aws
 
 # ---------------------------------------------------------------------------
 # Load .env at module level so os.getenv() picks up all configured values
@@ -46,6 +46,17 @@ app.include_router(router)
 @app.on_event("startup")
 def startup() -> None:
     init_db()
+    try:
+        count = sync_instances_from_aws()
+        import logging
+        logging.getLogger(__name__).info(
+            "Startup sync: %d instance(s) loaded from AWS into DB.", count
+        )
+    except Exception as exc:
+        import logging
+        logging.getLogger(__name__).warning(
+            "Startup AWS sync failed (continuing without sync): %s", exc
+        )
 
 
 # ---------------------------------------------------------------------------
